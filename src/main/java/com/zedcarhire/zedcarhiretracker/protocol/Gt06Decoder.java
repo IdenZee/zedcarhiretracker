@@ -12,25 +12,68 @@ public class Gt06Decoder implements Decoder {
     }
 
     private static int intAt(byte[] b, int off) {
+        if (off + 3 >= b.length) return 0;
         return ByteBuffer.wrap(new byte[]{b[off], b[off + 1], b[off + 2], b[off + 3]}).getInt();
     }
 
     private static String decodeImeiFromLogin(byte[] pkt) {
-        StringBuilder sb = new StringBuilder();
+        // GT06 Login packet structure:
+        // 78 78 [LEN] 01 [IMEI: 8 bytes in BCD] [SERIAL] [CRC] 0D 0A
+        //
+        // Example: 78 78 0D 01 | 03 54 77 83 45 25 36 71 | 00 8C | 14 64 | 0D 0A
+        //                         ^^^^^^^^^^^^^^^^^^^^^^^^
+        //                              8 bytes IMEI in BCD
+        //
+        // IMEI 354778345253671 is stored as:
+        // 0x03547783 45253671 in hex
+        // Which is BCD: 0 3 5 4 7 7 8 3 4 5 2 5 3 6 7 1
+        // We skip the leading 0 to get: 3 5 4 7 7 8 3 4 5 2 5 3 6 7 1
+
+        // Extract 8 bytes starting from index 4 (IMEI starts right after protocol byte)
+        StringBuilder imei = new StringBuilder();
         for (int i = 4; i < 12 && i < pkt.length; i++) {
-            sb.append(String.format("%02X", pkt[i]));
+            // Each byte contains 2 BCD digits (4 bits each)
+            int high = (pkt[i] >> 4) & 0x0F;
+            int low = pkt[i] & 0x0F;
+
+            // Skip leading zeros and padding (0xF)
+            if (imei.length() == 0 && high == 0) {
+                // Skip leading zero in first nibble
+            } else {
+                imei.append(high);
+            }
+
+            if (low != 0x0F) { // 0xF is padding for odd-length numbers
+                imei.append(low);
+            }
         }
-        return sb.toString();
+
+        String result = imei.toString();
+
+        // IMEI should be 15 digits - if we got 16, the first one was likely padding
+        if (result.length() == 16 && result.charAt(0) == '0') {
+            result = result.substring(1);
+        }
+
+        System.out.println("[DECODER] Extracted IMEI: " + result + " (length: " + result.length() + ")");
+        return result;
     }
 
     @Override
     public Decoded decode(byte[] pkt, Socket socket) {
         if (pkt.length < 5) return null;
 
-        int proto = pkt[3] & 0xFF;
+        // Check if this is a long packet (79 79) or short packet (78 78)
+        boolean isLongPacket = (pkt[0] == 0x79 && pkt[1] == 0x79);
+
+        // For long packets, protocol is at index 4, for short packets it's at index 3
+        int proto = isLongPacket ? (pkt[4] & 0xFF) : (pkt[3] & 0xFF);
+
         Decoded out = new Decoded();
         out.rawHex = toHex(pkt);
         out.protocol = "GT06";
+
+        System.out.println("[DECODER] Packet type: " + (isLongPacket ? "LONG (79 79)" : "SHORT (78 78)") + ", Protocol: 0x" + String.format("%02X", proto));
 
         try {
             // LOGIN (0x01)
@@ -43,8 +86,6 @@ public class Gt06Decoder implements Decoder {
             // HEARTBEAT (0x13)
             if (proto == 0x13) {
                 System.out.println("[DECODER] Heartbeat packet detected");
-                // Heartbeat is valid but contains no GPS data
-                // Just return empty Decoded object so ACK is sent
                 return out;
             }
 
@@ -54,49 +95,135 @@ public class Gt06Decoder implements Decoder {
                 return out;
             }
 
-            // GPS packets (0x12, 0x22)
-            if (proto == 0x12 || proto == 0x22) {
+            // GPS packets (0x12, 0x22, 0x94)
+            if (proto == 0x12 || proto == 0x22 || proto == 0x94) {
                 System.out.println("[DECODER] GPS packet detected (proto=" + String.format("0x%02X", proto) + ")");
+                System.out.println("[DECODER] Packet length: " + pkt.length);
+                System.out.println("[DECODER] Full HEX: " + toHex(pkt));
 
-                // Time block is always [4..9]
-                int yy = pkt[4] & 0xFF;
-                int mm = pkt[5] & 0xFF;
-                int dd = pkt[6] & 0xFF;
-                int hh = pkt[7] & 0xFF;
-                int mi = pkt[8] & 0xFF;
-                int ss = pkt[9] & 0xFF;
-                out.gpsTime = LocalDateTime.of(2000 + yy, mm, dd, hh, mi, ss);
+                // For protocol 0x94 (long packet with extended info)
+                if (proto == 0x94 && isLongPacket) {
+                    // Manual packet structure analysis
+                    // 79 79 00 20 94 | 0A | 08 68 72 00 60 05 55 00 | 06 45 02 00 | 67 44 85 89 89 64 50 20 | 00 27 74 47 | 50 14 | 00 02 05 37 | 0D 0A
 
-                // Device variants differ here. Try both lat/lng offsets.
-                int[] latOffsets = {10, 11};
-                for (int latOffset : latOffsets) {
-                    try {
+                    System.out.println("[DECODER] Analyzing 0x94 packet structure (SMS-based tracker)...");
+
+                    // This tracker type sends GPS via SMS but packets via 0x94 might just be status
+                    // Let's try to find GPS data by looking for reasonable coordinate values
+
+                    // GPS coordinates are typically 4 bytes each
+                    // For Lusaka: Lat around -15° (negative), Lng around 28° (positive)
+                    // In raw format: values between 10M and 60M
+
+                    System.out.println("[DECODER] Searching for GPS coordinates in packet...");
+
+                    // Try all possible 4-byte positions for latitude
+                    for (int latOffset = 14; latOffset <= pkt.length - 10; latOffset++) {
                         int latRaw = intAt(pkt, latOffset);
                         int lngRaw = intAt(pkt, latOffset + 4);
+
+                        // Convert assuming standard GT06 format
                         double lat = latRaw / 1800000.0;
                         double lng = lngRaw / 1800000.0;
 
-                        // sanity check (if it fails, try next offset)
-                        if (Math.abs(lat) > 0.1 && Math.abs(lng) > 0.1) {
-                            out.latitude = lat;
-                            out.longitude = lng;
+                        // Check if coordinates are reasonable for Lusaka area
+                        if (Math.abs(lat) >= 10 && Math.abs(lat) <= 20 &&
+                                lng >= 20 && lng <= 35) {
 
-                            int speedOff = latOffset + 8;
-                            if (speedOff < pkt.length) out.speedKph = (double) (pkt[speedOff] & 0xFF);
+                            System.out.println("[DECODER] ✓ Possible GPS found at offset " + latOffset);
+                            System.out.println("[DECODER]   Raw Lat: " + latRaw + " (0x" + Integer.toHexString(latRaw) + ")");
+                            System.out.println("[DECODER]   Raw Lng: " + lngRaw + " (0x" + Integer.toHexString(lngRaw) + ")");
+                            System.out.println("[DECODER]   Decoded: " + lat + "°, " + lng + "°");
 
-                            int cOff = speedOff + 1;
-                            if (cOff + 1 < pkt.length) {
-                                int cs = ((pkt[cOff] & 0xFF) << 8) | (pkt[cOff + 1] & 0xFF);
-                                out.course = cs & 0x03FF;
+                            // Check if speed and course bytes make sense
+                            int speedOffset = latOffset + 8;
+                            int courseOffset = latOffset + 9;
+
+                            if (courseOffset + 1 < pkt.length) {
+                                int speedRaw = pkt[speedOffset] & 0xFF;
+                                int courseStatus = ((pkt[courseOffset] & 0xFF) << 8) | (pkt[courseOffset + 1] & 0xFF);
+                                int course = courseStatus & 0x03FF;
+                                boolean gpsFixed = (courseStatus & 0x1000) != 0;
+
+                                System.out.println("[DECODER]   Speed: " + speedRaw + " km/h");
+                                System.out.println("[DECODER]   Course: " + course + "° (0x" + Integer.toHexString(courseStatus) + ")");
+                                System.out.println("[DECODER]   GPS Fixed: " + gpsFixed);
+
+                                // If this looks reasonable, use it
+                                if (speedRaw <= 200 && course <= 360) {
+                                    // Use current time since packet doesn't contain valid timestamp
+                                    out.gpsTime = LocalDateTime.now();
+                                    out.latitude = lat;
+                                    out.longitude = lng;
+                                    out.speedKph = (double) speedRaw;
+                                    out.course = course;
+
+                                    System.out.println("[DECODER] ✅ GPS data decoded successfully!");
+                                    System.out.println("[DECODER] Note: Using current time (packet doesn't contain timestamp)");
+
+                                    return out;
+                                }
                             }
-                            return out;
                         }
-                    } catch (Exception ignored) {}
+                    }
+
+                    System.out.println("[DECODER] ERROR: Could not find valid GPS coordinates in packet");
+                    System.out.println("[DECODER] This 0x94 packet might be a status/info packet without GPS data");
+
+                    return null;
+                }
+
+                // Standard short packets (0x12, 0x22)
+                else if (!isLongPacket && (proto == 0x12 || proto == 0x22)) {
+                    int yy = pkt[4] & 0xFF;
+                    int mm = pkt[5] & 0xFF;
+                    int dd = pkt[6] & 0xFF;
+                    int hh = pkt[7] & 0xFF;
+                    int mi = pkt[8] & 0xFF;
+                    int ss = pkt[9] & 0xFF;
+                    out.gpsTime = LocalDateTime.of(2000 + yy, mm, dd, hh, mi, ss);
+
+                    int gpsDataLen = pkt[10] & 0xFF;
+                    System.out.println("[DECODER] GPS Data Length: " + gpsDataLen);
+
+                    int latRaw = intAt(pkt, 11);
+                    int lngRaw = intAt(pkt, 15);
+                    int speedRaw = pkt[19] & 0xFF;
+                    int courseStatus = ((pkt[20] & 0xFF) << 8) | (pkt[21] & 0xFF);
+
+                    int course = courseStatus & 0x03FF;
+                    boolean gpsFixed = (courseStatus & 0x1000) != 0;
+                    boolean latNorth = (courseStatus & 0x0400) == 0;
+                    boolean lngEast = (courseStatus & 0x0800) == 0;
+
+                    double lat = latRaw / 1800000.0;
+                    double lng = lngRaw / 1800000.0;
+
+                    if (!latNorth) lat = -lat;
+                    if (!lngEast) lng = -lng;
+
+                    System.out.println("[DECODER] Raw Lat: " + latRaw + " → " + lat + "° " + (latNorth ? "N" : "S"));
+                    System.out.println("[DECODER] Raw Lng: " + lngRaw + " → " + lng + "° " + (lngEast ? "E" : "W"));
+                    System.out.println("[DECODER] Speed: " + speedRaw + " km/h");
+                    System.out.println("[DECODER] Course: " + course + "°");
+                    System.out.println("[DECODER] GPS Fixed: " + gpsFixed);
+
+                    if (gpsFixed && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+                        out.latitude = lat;
+                        out.longitude = lng;
+                        out.speedKph = (double) speedRaw;
+                        out.course = course;
+                        return out;
+                    } else {
+                        System.out.println("[DECODER] WARNING: No GPS fix or invalid coordinates");
+                        return null;
+                    }
                 }
             }
 
         } catch (Exception e) {
             System.err.println("[DECODE ERROR] " + e.getMessage());
+            e.printStackTrace();
         }
         return null;
     }
@@ -109,15 +236,18 @@ public class Gt06Decoder implements Decoder {
 
     /**
      * Build acknowledgment packet for GT06 protocol
-     * Format: 78 78 [LEN] [PROTO] [SERIAL] [CRC] 0D 0A
+     * Format: 78 78 [LEN] [PROTO] [SERIAL] [CRC] 0D 0A (short)
+     *         79 79 [LEN_H] [LEN_L] [PROTO] [SERIAL] [CRC] 0D 0A (long)
      */
     public static byte[] buildAck(byte[] pkt) {
         if (pkt.length < 10) return null;
 
-        int proto = pkt[3] & 0xFF;
+        // Check if this is a long packet (79 79) or short packet (78 78)
+        boolean isLongPacket = (pkt[0] == 0x79 && pkt[1] == 0x79);
+
+        int proto = isLongPacket ? (pkt[4] & 0xFF) : (pkt[3] & 0xFF);
 
         // Extract serial number (2 bytes before CRC)
-        // Packet structure: 78 78 [LEN] [PROTO] [...data...] [SERIAL_H] [SERIAL_L] [CRC_H] [CRC_L] 0D 0A
         int serialH = pkt[pkt.length - 6] & 0xFF;
         int serialL = pkt[pkt.length - 5] & 0xFF;
 
@@ -147,22 +277,37 @@ public class Gt06Decoder implements Decoder {
                     0x0D, 0x0A            // Stop bits
             };
         }
-        // GPS ACK (0x12, 0x22)
-        else if (proto == 0x12 || proto == 0x22) {
-            ack = new byte[]{
-                    0x78, 0x78,           // Start bits
-                    0x05,                 // Length
-                    (byte) proto,         // Echo back the protocol
-                    (byte) serialH,       // Serial number high byte
-                    (byte) serialL,       // Serial number low byte
-                    0x00, 0x00,           // CRC placeholder
-                    0x0D, 0x0A            // Stop bits
-            };
+        // GPS ACK (0x12, 0x22, 0x94)
+        else if (proto == 0x12 || proto == 0x22 || proto == 0x94) {
+            if (isLongPacket) {
+                // Long packet ACK format
+                ack = new byte[]{
+                        0x79, 0x79,           // Start bits (long packet)
+                        0x00, 0x05,           // Length (2 bytes)
+                        (byte) proto,         // Echo back the protocol
+                        (byte) serialH,       // Serial number high byte
+                        (byte) serialL,       // Serial number low byte
+                        0x00, 0x00,           // CRC placeholder
+                        0x0D, 0x0A            // Stop bits
+                };
+            } else {
+                // Short packet ACK format
+                ack = new byte[]{
+                        0x78, 0x78,           // Start bits
+                        0x05,                 // Length
+                        (byte) proto,         // Echo back the protocol
+                        (byte) serialH,       // Serial number high byte
+                        (byte) serialL,       // Serial number low byte
+                        0x00, 0x00,           // CRC placeholder
+                        0x0D, 0x0A            // Stop bits
+                };
+            }
         }
 
         // Calculate and insert CRC if ACK was created
         if (ack != null) {
-            int crc = calculateCRC(ack, 2, ack.length - 6);
+            int startIdx = (ack[0] == 0x79) ? 2 : 2; // Both start at index 2
+            int crc = calculateCRC(ack, startIdx, ack.length - 6);
             ack[ack.length - 4] = (byte) ((crc >> 8) & 0xFF);
             ack[ack.length - 3] = (byte) (crc & 0xFF);
         }

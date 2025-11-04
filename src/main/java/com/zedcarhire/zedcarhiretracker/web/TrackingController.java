@@ -20,7 +20,7 @@ public class TrackingController {
 
     // Live/latest position
     @GetMapping("/live")
-    public TrackerData getLatest(@RequestParam String imei) {
+    public TrackerData getLatest(@RequestParam("imei") String imei) {
         return repo.findTop1ByImeiOrderByGpsTimeDesc(imei)
                 .orElseThrow(() -> new RuntimeException("No data for IMEI: " + imei));
     }
@@ -28,10 +28,11 @@ public class TrackingController {
     // Route history for playback
     @GetMapping("/history")
     public List<TrackerData> getHistory(
-            @RequestParam String imei,
-            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime start,
-            @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime end) {
+            @RequestParam("imei") String imei,
+            @RequestParam("start") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime start,
+            @RequestParam("end") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) LocalDateTime end) {
 
         return repo.findByImeiAndGpsTimeBetweenOrderByGpsTimeAsc(imei, start, end);
     }
+
 }
