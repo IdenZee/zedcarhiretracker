@@ -103,18 +103,7 @@ public class Gt06Decoder implements Decoder {
 
                 // For protocol 0x94 (long packet with extended info)
                 if (proto == 0x94 && isLongPacket) {
-                    // Manual packet structure analysis
-                    // 79 79 00 20 94 | 0A | 08 68 72 00 60 05 55 00 | 06 45 02 00 | 67 44 85 89 89 64 50 20 | 00 27 74 47 | 50 14 | 00 02 05 37 | 0D 0A
-
                     System.out.println("[DECODER] Analyzing 0x94 packet structure (SMS-based tracker)...");
-
-                    // This tracker type sends GPS via SMS but packets via 0x94 might just be status
-                    // Let's try to find GPS data by looking for reasonable coordinate values
-
-                    // GPS coordinates are typically 4 bytes each
-                    // For Lusaka: Lat around -15° (negative), Lng around 28° (positive)
-                    // In raw format: values between 10M and 60M
-
                     System.out.println("[DECODER] Searching for GPS coordinates in packet...");
 
                     // Try all possible 4-byte positions for latitude
@@ -123,13 +112,15 @@ public class Gt06Decoder implements Decoder {
                         int lngRaw = intAt(pkt, latOffset + 4);
 
                         // Convert assuming standard GT06 format
-                        double lat = latRaw / 1800000.0;
-                        double lng = lngRaw / 1800000.0;
+                        double lat = Math.abs(latRaw / 1800000.0);  // Get absolute value first
+                        double lng = Math.abs(lngRaw / 1800000.0);
 
-                        // Check if coordinates are reasonable for Lusaka area
-                        if (Math.abs(lat) >= 10 && Math.abs(lat) <= 20 &&
-                                lng >= 20 && lng <= 35) {
+                        // Check if coordinates are reasonable for Zambia
+                        // Zambia: Latitude 8°-18° South, Longitude 22°-34° East
+                        boolean latValid = (lat >= 8 && lat <= 18);
+                        boolean lngValid = (lng >= 22 && lng <= 34);
 
+                        if (latValid && lngValid) {
                             System.out.println("[DECODER] ✓ Possible GPS found at offset " + latOffset);
                             System.out.println("[DECODER]   Raw Lat: " + latRaw + " (0x" + Integer.toHexString(latRaw) + ")");
                             System.out.println("[DECODER]   Raw Lng: " + lngRaw + " (0x" + Integer.toHexString(lngRaw) + ")");
@@ -146,12 +137,17 @@ public class Gt06Decoder implements Decoder {
                                 boolean gpsFixed = (courseStatus & 0x1000) != 0;
 
                                 System.out.println("[DECODER]   Speed: " + speedRaw + " km/h");
-                                System.out.println("[DECODER]   Course: " + course + "° (0x" + Integer.toHexString(courseStatus) + ")");
+                                System.out.println("[DECODER]   Course: " + course + "°");
                                 System.out.println("[DECODER]   GPS Fixed: " + gpsFixed);
+
+                                // ALWAYS force Southern hemisphere for Zambia operations
+                                lat = -Math.abs(lat);
+                                lng = Math.abs(lng);  // Eastern hemisphere
+
+                                System.out.println("[DECODER]   Final (Zambia): " + lat + "°S, " + lng + "°E");
 
                                 // If this looks reasonable, use it
                                 if (speedRaw <= 200 && course <= 360) {
-                                    // Use current time since packet doesn't contain valid timestamp
                                     out.gpsTime = LocalDateTime.now();
                                     out.latitude = lat;
                                     out.longitude = lng;
@@ -159,7 +155,7 @@ public class Gt06Decoder implements Decoder {
                                     out.course = course;
 
                                     System.out.println("[DECODER] ✅ GPS data decoded successfully!");
-                                    System.out.println("[DECODER] Note: Using current time (packet doesn't contain timestamp)");
+                                    System.out.println("[DECODER] Location: " + out.latitude + ", " + out.longitude);
 
                                     return out;
                                 }
@@ -168,8 +164,6 @@ public class Gt06Decoder implements Decoder {
                     }
 
                     System.out.println("[DECODER] ERROR: Could not find valid GPS coordinates in packet");
-                    System.out.println("[DECODER] This 0x94 packet might be a status/info packet without GPS data");
-
                     return null;
                 }
 
@@ -196,23 +190,31 @@ public class Gt06Decoder implements Decoder {
                     boolean latNorth = (courseStatus & 0x0400) == 0;
                     boolean lngEast = (courseStatus & 0x0800) == 0;
 
-                    double lat = latRaw / 1800000.0;
-                    double lng = lngRaw / 1800000.0;
+                    // Get absolute values first
+                    double lat = Math.abs(latRaw / 1800000.0);
+                    double lng = Math.abs(lngRaw / 1800000.0);
 
-                    if (!latNorth) lat = -lat;
-                    if (!lngEast) lng = -lng;
-
-                    System.out.println("[DECODER] Raw Lat: " + latRaw + " → " + lat + "° " + (latNorth ? "N" : "S"));
-                    System.out.println("[DECODER] Raw Lng: " + lngRaw + " → " + lng + "° " + (lngEast ? "E" : "W"));
+                    System.out.println("[DECODER] Raw Lat: " + latRaw + " → " + lat + "°");
+                    System.out.println("[DECODER] Raw Lng: " + lngRaw + " → " + lng + "°");
+                    System.out.println("[DECODER] Hemisphere flags: " + (latNorth ? "N" : "S") + ", " + (lngEast ? "E" : "W") + " (IGNORED)");
                     System.out.println("[DECODER] Speed: " + speedRaw + " km/h");
                     System.out.println("[DECODER] Course: " + course + "°");
                     System.out.println("[DECODER] GPS Fixed: " + gpsFixed);
+
+                    // ALWAYS force Southern hemisphere (Zambia is entirely south of equator)
+                    // ALWAYS force Eastern hemisphere (Zambia is entirely east of prime meridian)
+                    lat = -Math.abs(lat);
+                    lng = Math.abs(lng);
+
+                    System.out.println("[DECODER] ✓ Applied Zambia hemisphere: " + lat + "°S, " + lng + "°E");
 
                     if (gpsFixed && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
                         out.latitude = lat;
                         out.longitude = lng;
                         out.speedKph = (double) speedRaw;
                         out.course = course;
+
+                        System.out.println("[DECODER] ✅ Final GPS: " + out.latitude + ", " + out.longitude);
                         return out;
                     } else {
                         System.out.println("[DECODER] WARNING: No GPS fix or invalid coordinates");
@@ -227,7 +229,6 @@ public class Gt06Decoder implements Decoder {
         }
         return null;
     }
-
     public static String toHex(byte[] pkt) {
         StringBuilder sb = new StringBuilder();
         for (byte b : pkt) sb.append(String.format("%02X", b));
